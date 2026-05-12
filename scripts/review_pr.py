@@ -56,7 +56,7 @@ def main():
 
     client = genai.Client(
         api_key=os.environ["GEMINI_API_KEY"],
-        http_options=types.HttpOptions(api_version="v1beta"),  
+        http_options=types.HttpOptions(api_version="v1"),  
     )
 
     files = list(pr.get_files())
