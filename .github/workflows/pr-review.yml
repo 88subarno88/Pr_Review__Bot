@@ -3,11 +3,11 @@ name: Ai assisted Pr review Bot
 on:
   pull_request:
     types: [opened, synchronize]
-    paths-ignore:
-      - "**/*.md"
-      - "**/*.txt"
-      - ".gitignore"
-      - "LICENSE"
+    # paths-ignore:
+    #   - "**/*.md"
+    #   - "**/*.txt"
+    #   - ".gitignore"
+    #   - "LICENSE"
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
