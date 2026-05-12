@@ -56,7 +56,7 @@ def main():
 
     client = genai.Client(
         api_key=os.environ["GEMINI_API_KEY"],
-        http_options=types.HttpOptions(api_version="v1beta"),  
+        http_options=types.HttpOptions(api_version="v1"),  
     )
 
     files = list(pr.get_files())
@@ -73,7 +73,7 @@ def main():
 
     print("Sending to Gemini...")
     response = client.models.generate_content(
-        model="gemini-2.5-flash-preview-05-20",  
+        model="gemini-2.0-flash",  
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
