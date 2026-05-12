@@ -74,12 +74,16 @@ def main():
     print("Sending to Gemini...")
     response = client.models.generate_content(
         model="gemini-2.0-flash",  
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.2,   
-            max_output_tokens=8200,
-        ),
+        contents=[
+        types.Content(
+            role="user",
+            parts=[types.Part(text=f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\n---\n\n{prompt}")]
+        )
+    ],
+    config=types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=8200,
+    ),
     )
 
     review_text = response.text
