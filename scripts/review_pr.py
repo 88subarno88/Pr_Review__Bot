@@ -68,7 +68,7 @@ def main():
     print("Sending to Gemini...")
 
     response = client.models.generate_content(
-        model="gemini-1.5-flash-latest",
+        model="gemini-2.5-flash",
         contents=full_prompt,
         config=types.GenerateContentConfig(
             temperature=0.2,
