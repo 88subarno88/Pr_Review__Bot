@@ -1,0 +1,19 @@
+# fine-tuning stack (install in finetune/.venv, NOT the bot's env)
+unsloth
+trl>=0.12
+peft
+transformers
+datasets
+bitsandbytes
+accelerate
+wandb
+
+# evaluation
+rouge-score
+sacrebleu
+google-genai          # Gemini baseline + judge (same SDK your bot uses)
+
+# data + serving + demo
+requests
+python-dotenv
+gradio
