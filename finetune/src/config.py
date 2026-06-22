@@ -31,3 +31,8 @@ ADAPTER_DIR = "adapters/r16"
 RESULTS_DIR = "results"
 GEMINI_MODEL = "gemini-2.5-flash"   
 OLLAMA_MODEL = "pr-reviewer"
+
+# --- eval / serving ---
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_COST_PER_1K = None   
+OLLAMA_MODEL = "pr-reviewer"
