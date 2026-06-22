@@ -1,0 +1,9 @@
+
+# finetune
+finetune/data/raw/
+finetune/out/
+finetune/.venv/
+finetune/**/__pycache__/
+*.gguf
+.env
+wandb/
