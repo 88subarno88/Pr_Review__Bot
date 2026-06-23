@@ -1,6 +1,5 @@
 FROM ./gguf/qwen2.5-coder-3b-instruct.Q4_K_M.gguf
-SYSTEM "You are a senior code reviewer. Given a single code diff hunk, write ONE concise, actionable review comment about the most important issue. No greetings, no preamble, no markdown headers."
+SYSTEM "You are a senior code reviewer. Given a code diff, write ONE short review comment (1-2 sentences) about the single most important issue. Be specific. No code blocks, no preamble."
 PARAMETER temperature 0.2
 PARAMETER num_predict 80
-PARAMETER repeat_penalty 1.3
-PARAMETER stop "```suggestion"
+PARAMETER repeat_penalty 1.2
