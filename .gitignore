@@ -1,9 +1,8 @@
-
-# finetune
-finetune/data/raw/
-finetune/out/
-finetune/.venv/
-finetune/**/__pycache__/
-*.gguf
 .env
-wandb/
+finetune/.env
+finetune/gguf/
+finetune/adapters/
+finetune/results/preds_cache.json
+__pycache__/
+*.pyc
+.venv/
