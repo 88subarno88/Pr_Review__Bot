@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from google import genai
 from google.genai import types
@@ -68,23 +69,47 @@ def review_with_gemini(system_prompt: str, prompt: str) -> str:
 
 
 # Local fine-tuned backend
-def review_with_local(system_prompt: str, files) -> str:
-    """Review each diff hunk via the locally-served fine-tuned model (Ollama)."""
+LOCAL_SYSTEM = (
+    "You are a senior code reviewer. Given a code diff, write ONE short review "
+    "comment (1-2 sentences) about the single most important issue. Be specific."
+)
+
+
+def _clean(text: str) -> str:
+    """Strip code fences / suggestion blocks so the comment renders as plain text."""
+    text = text.replace("```suggestion", "").replace("```", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def review_with_local(files) -> str:
     endpoint = os.environ.get("OLLAMA_URL", "http://localhost:11434") + "/api/generate"
     sections = []
     for f in files:
         if not f.patch:
             continue
-        r = requests.post(endpoint, json={
-            "model": "pr-reviewer",
-            "system": system_prompt,
-            "prompt": f"Review this change:\n```diff\n{f.patch}\n```",
-            "stream": False,
-            "options": {"temperature": 0.2, "num_predict": 80, "repeat_penalty": 1.3},
-        })
-        r.raise_for_status()
-        comment = r.json()["response"].strip()
-        sections.append(f"### `{f.filename}`\n{comment}")
+        # split the file patch into individual @@ hunks (training distribution)
+        hunks = re.split(r'(?=^@@ )', f.patch, flags=re.M)
+        hunks = [h for h in hunks if h.strip().startswith("@@")]
+        if not hunks:
+            hunks = [f.patch]
+
+        comments = []
+        for hunk in hunks[:6]:                    # cap to avoid spamming huge PRs
+            r = requests.post(endpoint, json={
+                "model": "pr-reviewer",
+                "system": LOCAL_SYSTEM,
+                "prompt": f"Review this change:\n```diff\n{hunk.strip()}\n```",
+                "stream": False,
+                "options": {"temperature": 0.2, "num_predict": 80, "repeat_penalty": 1.2},
+            })
+            r.raise_for_status()
+            c = _clean(r.json().get("response", ""))
+            if len(c) >= 5:
+                comments.append(f"- {c}")
+
+        body = "\n".join(comments) if comments else "_(model flagged no specific issue)_"
+        sections.append(f"### `{f.filename}`\n{body}")
     return "\n\n".join(sections) if sections else "_No reviewable diffs found._"
 
 
@@ -102,12 +127,11 @@ def main():
     print(f"  Files changed: {len(files)}")
     print(f"  Backend:       {backend}")
 
-    system_prompt = load_system_prompt()
-
     if backend == "local":
         print("Reviewing with local fine-tuned model (Ollama)...")
-        review_text = review_with_local(system_prompt, files)
+        review_text = review_with_local(files)
     else:
+        system_prompt = load_system_prompt()
         prompt = build_prompt(pr, files, repo, base_ref)
         print(f"  Prompt size:   ~{len(prompt) // 4:,} tokens")
         print("Sending to Gemini...")

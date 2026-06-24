@@ -1,180 +1,190 @@
-import os, re, time, json, argparse
-from dotenv import load_dotenv
-load_dotenv()
+import os, re, json, time, requests
+from rouge_score import rouge_scorer
+import sacrebleu
 
-import config as C
-from format import (load_jsonl, build_inference_prompt,
-                    build_fewshot_prompt, load_fewshot)
+OLLAMA = "http://localhost:11434/api/generate"
+TUNED_MODEL = "pr-reviewer"
+BASE_MODEL  = "qwen2.5-coder:3b"
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+JUDGE_MODEL = "qwen2.5:7b"           # local judge 
+TEST_PATH = "data/test.jsonl"
+JUDGE_N = 60
+CACHE = "results/preds_cache.json"
 
+SYSTEM = ("You are a senior code reviewer. Given a code diff, write ONE short review "
+          "comment (1-2 sentences) about the single most important issue. Be specific.")
 
-# HF generators
-def make_hf_generator(adapter_dir=None):
-    from unsloth import FastLanguageModel
-    import torch
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=C.MODEL_ID, max_seq_length=C.MAX_SEQ_LEN,
-        load_in_4bit=True, dtype=None,
-    )
-    if adapter_dir:
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, adapter_dir)
-    FastLanguageModel.for_inference(model)          # 2x faster inference
-    shots = load_fewshot(n=3)
+def load(p): return [json.loads(l) for l in open(p)]
+def user_turn(diff): return f"Review this change:\n```diff\n{diff}\n```"
+def clean(t): return re.sub(r"\s+", " ", t.replace("```suggestion","").replace("```","")).strip()
 
-    def gen(diff, fewshot=False):
-        prompt = (build_fewshot_prompt(diff, tokenizer, shots) if fewshot
-                  else build_inference_prompt(diff, tokenizer))
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=128, do_sample=False,
-                                  pad_token_id=tokenizer.eos_token_id)
-        text = tokenizer.decode(out[0][inputs.input_ids.shape[1]:],
-                                skip_special_tokens=True)
-        return text.strip()
-    return gen
+# persistent cache
+def load_cache():
+    if os.path.exists(CACHE):
+        return json.load(open(CACHE))
+    return {"preds": {}, "judge": {}, "latency": {}}
 
+def save_cache(c):
+    os.makedirs("results", exist_ok=True)
+    tmp = CACHE + ".tmp"
+    json.dump(c, open(tmp, "w"))
+    os.replace(tmp, CACHE)
 
-#  Gemini (gen + judge)
-def _gemini():
-    from google import genai
-    from google.genai import types
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
-                          http_options=types.HttpOptions(api_version="v1"))
-    return client, types
+# generators
+def ollama_gen(model, diff):
+    r = requests.post(OLLAMA, json={
+        "model": model, "system": SYSTEM, "prompt": user_turn(diff),
+        "stream": False,
+        "options": {"temperature": 0.2, "num_predict": 100, "repeat_penalty": 1.2},
+    })
+    r.raise_for_status()
+    return clean(r.json().get("response", ""))
 
-
-def _gemini_call(client, types, system, user, max_tokens=128, retries=6):
-    for attempt in range(retries):
+def gemini_call(system, user, max_tokens=120, retries=4):
+    url = (f"https://generativelanguage.googleapis.com/v1/models/"
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}")
+    payload = {"contents":[{"parts":[{"text":f"{system}\n\n{user}"}]}],
+               "generationConfig":{"temperature":0.2,"maxOutputTokens":max_tokens,
+                                   "thinkingConfig":{"thinkingBudget":0}}}
+    for a in range(retries):
         try:
-            resp = client.models.generate_content(
-                model=C.GEMINI_MODEL,
-                contents=[types.Content(role="user", parts=[types.Part(
-                    text=f"SYSTEM INSTRUCTIONS:\n{system}\n\n---\n\n{user}")])],
-                config=types.GenerateContentConfig(temperature=0.2,
-                                                   max_output_tokens=max_tokens),
-            )
-            time.sleep(7)                     # gentle throttle for free-tier RPM
-            return (resp.text or "").strip()
+            r = requests.post(url, json=payload, timeout=60)
+            if r.status_code in (429,503,500):
+                w = 8*(2**a); print(f"  gemini {r.status_code}, wait {w}s"); time.sleep(w); continue
+            r.raise_for_status()
+            data = r.json()
+            cand = data.get("candidates", [{}])[0]
+            parts = cand.get("content", {}).get("parts", [])
+            text = parts[0].get("text", "") if parts else ""
+            time.sleep(5)
+            return text.strip()
         except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e).upper():
-                wait = 5 * (2 ** attempt)
-                print(f"  rate-limited, backing off {wait}s...")
-                time.sleep(wait)
-                continue
-            raise
+            print("  gemini err:", str(e)[:80]); time.sleep(5)
     return ""
+def gemini_gen(diff):
+    return clean(gemini_call(SYSTEM, user_turn(diff)))
 
-
-def make_gemini_generator():
-    client, types = _gemini()
-    def gen(diff, fewshot=False):
-        return _gemini_call(client, types, C.SYSTEM_PROMPT,
-                            f"Review this change:\n```diff\n{diff}\n```")
-    return gen
-
-
-JUDGE_SYS = (
-    "You evaluate code-review comments. Given a diff and a CANDIDATE review, score how "
-    "useful and correct the candidate is as a review of that diff, 1 (useless/wrong) to "
-    "5 (sharp, correct, actionable). A human reference is given as ONE example of a valid "
-    "review; the candidate may be worded differently and still be excellent. Judge the "
-    "candidate on its own merit. Reply with ONLY the integer 1-5."
-)
-
-
-def make_judge():
-    client, types = _gemini()
-    def judge(diff, candidate, reference):
-        if not candidate.strip():
-            return 1
-        user = (f"DIFF:\n```diff\n{diff}\n```\n\nHUMAN REFERENCE:\n{reference}\n\n"
-                f"CANDIDATE:\n{candidate}\n\nScore (1-5):")
-        out = _gemini_call(client, types, JUDGE_SYS, user, max_tokens=4)
-        m = re.search(r"[1-5]", out)
-        return int(m.group()) if m else 1
-    return judge
-
-
-# metrics
+# metrics 
+SC = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
 def task_metrics(preds, refs):
-    from rouge_score import rouge_scorer
-    import sacrebleu
-    sc = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-    rl = sum(sc.score(r, p)["rougeL"].fmeasure
-             for p, r in zip(preds, refs)) / max(len(preds), 1)
+    rl = sum(SC.score(r,p)["rougeL"].fmeasure for p,r in zip(preds,refs))/len(preds)
     bleu = sacrebleu.corpus_bleu(preds, [refs]).score
-    return {"rougeL": round(rl, 4), "bleu": round(bleu, 2)}
+    return round(rl,4), round(bleu,2)
 
+# LOCAL judge (qwen2.5:7b via Ollama) 
+JUDGE_SYS = ("You evaluate code-review comments. Given a DIFF and a CANDIDATE review, "
+             "rate how useful and correct the candidate is from 1 (useless/wrong) to "
+             "5 (sharp, correct, actionable). A human REFERENCE is one valid example; "
+             "the candidate may be worded differently and still be excellent. "
+             "Reply with ONLY a single digit 1-5 and nothing else.")
+def judge_one(diff, cand, ref):
+    if len(cand) < 3:
+        return 1
+    prompt = (f"DIFF:\n{diff}\n\nHUMAN REFERENCE:\n{ref}\n\n"
+              f"CANDIDATE REVIEW:\n{cand}\n\nScore (1-5):")
+    r = requests.post(OLLAMA, json={
+        "model": JUDGE_MODEL, "system": JUDGE_SYS, "prompt": prompt,
+        "stream": False, "options": {"temperature": 0.0, "num_predict": 5},
+    })
+    r.raise_for_status()
+    out = r.json().get("response", "")
+    m = re.findall(r"[1-5]", out)
+    return int(m[-1]) if m else None
 
-# main
+# generation with per-item caching
+def gen_local_cached(name, model, diffs, cache):
+    done = cache["preds"].get(name, [])
+    if len(done) >= len(diffs):
+        print(f"{name}: already cached ({len(done)})"); return done
+    print(f"\n=== generating {name} (resuming at {len(done)}/{len(diffs)}) ===")
+    for i in range(len(done), len(diffs)):
+        done.append(ollama_gen(model, diffs[i]))
+        if (i+1) % 20 == 0:
+            cache["preds"][name] = done; save_cache(cache); print(f"  {i+1}/{len(diffs)}")
+    cache["preds"][name] = done; save_cache(cache)
+    return done
+
+def gen_gemini_cached(diffs, judge_idx, cache):
+    done = cache["preds"].get("gemini", [])
+    if len(done) >= len(judge_idx):
+        print(f"gemini: already cached ({len(done)})"); return done
+    print(f"\n=== generating gemini (resuming at {len(done)}/{len(judge_idx)}) ===")
+    for k in range(len(done), len(judge_idx)):
+        done.append(gemini_gen(diffs[judge_idx[k]]))
+        cache["preds"]["gemini"] = done; save_cache(cache)
+        print(f"  gemini {k+1}/{len(judge_idx)}")
+    return done
+
+# judging with per-item caching 
+def judge_cached(name, diffs, preds, refs, judge_idx, cache):
+    done = cache["judge"].get(name, [])
+    targets = judge_idx if name != "gemini" else list(range(len(judge_idx)))
+    if len(done) >= len(targets):
+        print(f"judge[{name}]: already cached ({len(done)})"); return done
+    print(f"=== judging {name} (resuming at {len(done)}/{len(targets)}) ===")
+    for k in range(len(done), len(targets)):
+        if name == "gemini":
+            d, p, r = diffs[judge_idx[k]], preds[k], refs[judge_idx[k]]
+        else:
+            idx = judge_idx[k]; d, p, r = diffs[idx], preds[idx], refs[idx]
+        done.append(judge_one(d, p, r))
+        cache["judge"][name] = done; save_cache(cache)
+        print(f"  judge[{name}] {k+1}/{len(targets)} -> {done[-1]}")
+    return done
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--models", nargs="+", default=["base", "prompt", "gemini"])
-    ap.add_argument("--adapter", default=C.ADAPTER_DIR)
-    ap.add_argument("--limit", type=int, default=0, help="first N test rows (0=all)")
-    ap.add_argument("--no-judge", action="store_true", help="skip LLM-judge (saves quota)")
-    args = ap.parse_args()
-
-    test = load_jsonl("data/test.jsonl")
-    if args.limit:
-        test = test[:args.limit]
+    test = load(TEST_PATH)
     diffs = [t["diff_hunk"] for t in test]
-    refs = [t["body"] for t in test]
-    print(f"evaluating on {len(test)} test rows")
+    refs  = [t["body"] for t in test]
+    judge_idx = list(range(min(JUDGE_N, len(test))))
+    cache = load_cache()
+    print(f"test rows: {len(test)} | judged subset: {len(judge_idx)}")
 
-    # build only the generators we need (lazy -> gemini-only needs no GPU stack)
-    hf = make_hf_generator(None) if ({"base", "prompt"} & set(args.models)) else None
-    tuned = make_hf_generator(args.adapter) if "tuned" in args.models else None
-    gem = make_gemini_generator() if "gemini" in args.models else None
-    judge = None if args.no_judge else make_judge()
+    t0 = time.time(); gen_local_cached("base", BASE_MODEL, diffs, cache)
+    cache["latency"]["base"] = cache["latency"].get("base") or round((time.time()-t0)/len(diffs),3)
+    t0 = time.time(); gen_local_cached("tuned", TUNED_MODEL, diffs, cache)
+    cache["latency"]["tuned"] = cache["latency"].get("tuned") or round((time.time()-t0)/len(diffs),3)
+    gen_gemini_cached(diffs, judge_idx, cache)
+    save_cache(cache)
 
-    plan = {"base": (hf, False), "prompt": (hf, True),
-            "tuned": (tuned, False), "gemini": (gem, False)}
+    for name in ["base", "tuned", "gemini"]:
+        judge_cached(name, diffs, cache["preds"][name], refs, judge_idx, cache)
+    save_cache(cache)
 
-    results, samples = {}, []
-    for name in args.models:
-        gen, fewshot = plan[name]
-        print(f"\n=== {name} ===")
-        t0, preds = time.time(), []
-        for i, d in enumerate(diffs):
-            preds.append(gen(d, fewshot=fewshot))
-            if (i + 1) % 20 == 0:
-                print(f"  {i+1}/{len(diffs)}")
-        latency = (time.time() - t0) / max(len(diffs), 1)
+    results = {}
+    for name in ["base", "tuned", "gemini"]:
+        p = cache["preds"][name]
+        if name == "gemini":
+            rl, bleu = task_metrics(p, [refs[i] for i in judge_idx])
+        else:
+            rl, bleu = task_metrics(p, refs)
+        js = [s for s in cache["judge"].get(name, []) if s is not None]
+        results[name] = {"rougeL":rl, "bleu":bleu,
+                         "judge": round(sum(js)/len(js),2) if js else None,
+                         "judge_n": len(js), "latency_s": cache["latency"].get(name)}
+        print(f"{name}: rougeL={rl} bleu={bleu} judge={results[name]['judge']} (n={len(js)})")
 
-        m = task_metrics(preds, refs)
-        if judge:
-            scores = [judge(d, p, r) for d, p, r in zip(diffs, preds, refs)]
-            m["judge"] = round(sum(scores) / len(scores), 2)
-        m["latency_s_per_req"] = round(latency, 3)
-        m["cost_per_1k_usd"] = (0.0 if name != "gemini" else C.GEMINI_COST_PER_1K)
-        results[name] = m
-        print(name, "->", m)
+    json.dump(results, open("results/eval_scores.json","w"), indent=2)
+    write_md(results, len(test), len(judge_idx))
+    print("\nwrote results/comparison.md + eval_scores.json")
 
-        # stash first 5 predictions for the README side-by-side
-        for d, p in list(zip(diffs, preds))[:5]:
-            samples.append({"model": name, "diff": d[:300], "pred": p})
-
-    is_baseline = "tuned" not in args.models
-    out = f"{C.RESULTS_DIR}/{'baseline' if is_baseline else 'tuned'}_scores.json"
-    os.makedirs(C.RESULTS_DIR, exist_ok=True)
-    json.dump(results, open(out, "w"), indent=2)
-    json.dump(samples, open(f"{C.RESULTS_DIR}/sample_predictions.json", "w"), indent=2)
-    write_comparison_md(results)
-    print(f"\nwrote {out} + comparison.md")
-
-
-def write_comparison_md(results):
-    lines = ["# Base vs Prompt vs Tuned vs Gemini (held-out test set)\n",
-             "| Model | ROUGE-L | BLEU | Judge (1-5) | Latency/req | Cost/1k |",
-             "|---|---|---|---|---|---|"]
-    for name, m in results.items():
-        lines.append(f"| {name} | {m['rougeL']} | {m['bleu']} | {m.get('judge','-')} "
-                     f"| {m['latency_s_per_req']}s | {m['cost_per_1k_usd']} |")
-    lines.append("\n> ROUGE/BLEU are weak proxies for review quality; the judge score "
-                 "is the metric that matters. Headline goes here after Phase 4.")
-    open(f"{C.RESULTS_DIR}/comparison.md", "w").write("\n".join(lines))
-
+def write_md(r, n_all, n_judge):
+    cost = {"base":"$0 (local)","tuned":"$0 (local)","gemini":"~API cost"}
+    L = ["# Code-Review Model Comparison (held-out test set)\n",
+         f"ROUGE-L / BLEU over all {n_all} rows (Gemini over {n_judge}) · LLM-judge "
+         f"(qwen2.5:7b, local) over {n_judge} rows.\n",
+         "| Model | ROUGE-L | BLEU | Judge (1-5) | Latency/req | Cost |",
+         "|---|---|---|---|---|---|"]
+    for k in ["base","tuned","gemini"]:
+        m=r[k]; L.append(f"| {k} | {m['rougeL']} | {m['bleu']} | {m['judge']} "
+                         f"| {m['latency_s']}s | {cost[k]} |")
+    L += ["","## Notes",
+          "- ROUGE/BLEU are weak proxies for free-form review; the judge score is the metric that matters.",
+          "- base and tuned are the same 3B model; the delta is the fine-tuning effect.",
+          "- Judged locally with qwen2.5:7b for full reproducibility (no API dependency).",
+          "- Gemini is the frontier baseline (whole-PR context vs per-hunk for the local models)."]
+    open("results/comparison.md","w").write("\n".join(L))
 
 if __name__ == "__main__":
     main()

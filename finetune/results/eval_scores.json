@@ -1,0 +1,23 @@
+{
+  "base": {
+    "rougeL": 0.0991,
+    "bleu": 1.41,
+    "judge": 3.2,
+    "judge_n": 20,
+    "latency_s": 0.0
+  },
+  "tuned": {
+    "rougeL": 0.0901,
+    "bleu": 2.38,
+    "judge": 2.9,
+    "judge_n": 20,
+    "latency_s": 0.0
+  },
+  "gemini": {
+    "rougeL": 0.0613,
+    "bleu": 0.0,
+    "judge": 2.9,
+    "judge_n": 20,
+    "latency_s": null
+  }
+}

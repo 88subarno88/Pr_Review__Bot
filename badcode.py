@@ -1,23 +1,17 @@
-def DO_STUFF(x):
-  import math
-  import time
-  list1 = []
-  for i in range(10):
-    list1.append(i)
-  a = x
-  b = a + 1
-  if x == 1:
-      print("one")
-  elif x == 2:
-      print("two")
-  else:
-      pass
-  
-  while True:
-      if a > 5:
-          break
-      a = a + 1
-      
-  return a
+import pickle
 
-print(DO_STUFF(3))
+def get_user(user_id):
+    query = "SELECT * FROM users WHERE id = " + user_id   # SQL injection
+    return db.execute(query)
+
+def divide(a, b):
+    return a / b   # no zero-division guard
+
+def load_config(raw):
+    return pickle.loads(raw)   # unsafe deserialization
+
+password = "admin123"   # hardcoded credential
+
+def read_file(path):
+    f = open(path)   # file never closed
+    return f.read()
